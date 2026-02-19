@@ -3,6 +3,109 @@
 
 ---
 
+## Problemi Yorumlama
+
+### Problemi Nasıl Tanımlıyorum
+
+Kullanıcılar dokümanları bulamıyor ve bu yüzden aynı dosyayı tekrar yüklüyor. Tekrar yükleme arama sonuçlarını daha da karmaşık hale getiriyor. Sorun kendi kendini besleyen bir kısır döngüye giriyor.
+
+Baktığımızda "arama çalışmıyor" gibi görünse de asıl sorun **sistemin kullanıcıya geri bildirim vermemesi**. Kullanıcı sonuç bulamadığında ne yapacağını bilemiyor; sistemin dokümanı görmediğini mi, yoksa gerçekten olmadığını mı anlayamıyor.
+
+---
+
+### Gerçek Kök Neden Ne Olabilir?
+
+Tek bir kök neden yok. Birden fazla sorun aynı anda tetiklenmiş olabilir:
+
+| # | Olası Kök Neden | Belirti |
+|---|---|---|
+| 1 | Arama yalnızca tam dosya adı eşleşmesiyle çalışıyor | `"sözleşme"` yazınca `"Sozlesme_Final_v3.pdf"` çıkmıyor |
+| 2 | Dokümanlar kategori/tag olmadan yükleniyor | Filtreleme yapılamıyor, tüm sonuçlar karışık görünüyor |
+| 3 | Duplicate yükleme kontrolü yok | Aynı dosyanın birden fazla kopyası indekste birikim yapıyor |
+| 4 | Boş sonuçta kullanıcıya yönlendirme yok | Kullanıcı çaresiz kalıp tekrar yüklüyor |
+
+---
+
+### Bu Talep Yanlış Bir Varsayıma Dayanıyor Olabilir mi?
+
+Evet, iki konuda dikkatli olmak gerekiyor:
+
+**"Arama motoru değiştirilmeli"** varsayımı erken sonuca atlamak olur. Elasticsearch veya benzeri bir çözüm gerçekten daha iyi arama sağlar; ancak 3 ay içinde ek altyapı yatırımı yapılmayacağı kısıtı göz önünde bulundurulduğunda bu bir çözüm değil, yeni bir problemdir. Mevcut altyapının yetenekleri önce sonuna kadar kullanılmalı.
+
+**"Kullanıcılar aramayı bilmiyor"** varsayımı da yanıltıcı olabilir. Kullanıcı eğitimi kısa vadede çalışır gibi görünse de asıl sorun sistemin toleranssız olması — kullanıcının tam dosya adını bilmesini beklemek kötü UX tasarımıdır.
+
+---
+
+### Hangi Bilgiler Eksik?
+
+Çözüme başlamadan önce şu soruların yanıtlanması kararları doğrudan etkiler:
+
+| Soru | Neden Önemli | Varsayımım |
+|---|---|---|
+| Mevcut arama nasıl çalışıyor? `LIKE` mi, başka bir şey mi? | Çözümün başlangıç noktasını belirliyor | `LIKE` tabanlı veya tam eşleşme olduğunu varsaydım |
+| Dokümanlar yüklenirken metadata giriliyor mu? | Filtrelemenin ne kadar işe yarayacağını etkiliyor | Minimum metadata var |
+| 8.000 DAU içinde kaçı aynı anda aktif? | Cache boyutu ve DB yükünü etkiliyor | ~500 eş zamanlı kullanıcı |
+| Duplicate'in iş tanımı ne? Hash mi, isim mi, içerik mi? | Detection stratejisini belirliyor | SHA-256 içerik hash'i seçtim |
+| Şikayetler belirli bir doküman tipine mi odaklı? | Sorunun kapsamını daraltır | Tüm tipleri etkiliyor varsaydım |
+| Son 3 ayda sisteme ne kadar yeni doküman eklendi? | Büyüme hızı ölçekleme kararını etkiliyor | Bilinmiyor |
+
+---
+
+
+## Karar ve Tasarım Yaklaşımı
+
+### Hangi Yaklaşımı Seçtim ve Neden
+
+**Computed column + `EF.Functions.Like` + `IMemoryCache` + SHA-256 duplicate detection.**
+
+Kısıtlar netti: mevcut veritabanı değiştirilemez, 3 ay içinde ek altyapı yatırımı yok, 400ms response süresi korunmalı. Bu çerçevede "en iyi teknik çözüm" değil, "kısıtlar içinde en bilinçli çözüm" arandı.
+
+`SearchVector` computed column, SQL Server'ın native özelliği — yeni bir servis kurmadan, mevcut tablo üzerine stored, indexed bir kolon ekleyerek arama kalitesini artırıyor. `IMemoryCache` ile popüler sorgular cache'leniyor, 400ms hedefi korunuyor. SHA-256 hash ile duplicate tespiti, kısır döngünün kaynağını kesiyor.
+
+---
+
+### Bilerek Kabul Ettiğim Riskler
+
+| Risk | Neden Kabul Ettim |
+|---|---|
+| `LIKE '%term%'` leading wildcard — index kullanılamaz | 8.000 DAU bu ölçekte kabul edilebilir; büyüyünce `IDocumentSearchService` interface'i üzerinden geçiş hazır |
+| `IMemoryCache` multi-instance'da tutarsızlaşır | Şu an tek instance yeterli; Redis'e geçiş 1 satır DI değişikliği — kod buna hazır tasarlandı |
+| Uploads container içinde — container yeniden oluşunca kaybolur | Dev ortamı için pragmatik karar; production öncesi `IFileStorageService` → Blob Storage geçişi şart |
+| Türkçe karakter normalizasyonu uygulama katmanında | SQL Server collation'ına güvenmek yerine .NET tarafında kontrol altına alındı; tutarlı ama kusursuz değil |
+
+---
+
+### Yapmamayı Tercih Ettiğim Şeyler ve Neden
+
+**Elasticsearch eklemedim.**
+En sık akla gelen çözüm ama kısıt ihlali. Yeni altyapı = yeni ops yükü, yeni maliyet, yeni hata noktası. 3 aylık süreçte devreye almak riskli; üstelik mevcut altyapı bu ölçek için henüz yetersiz değil.
+
+**Redis cache eklemedim.**
+Tek instance için overkill. `IMemoryCache` şu anki yük için fazlasıyla yeterli. "İleride lazım olur" gerekçesiyle şimdiden eklemek gereksiz bağımlılık yaratır. Geçiş hazır, ama ihtiyaç doğmadan yapılmadı.
+
+**Event sourcing / CQRS eklemedim.**
+Bu ölçekte ve bu zaman diliminde overengineering. Mimari sadeliği korumak bilinçli bir karar.
+
+**Kullanıcı arayüzü geliştirmedim.**
+Backend API düzeltildi; mevcut frontend bu API'yi tüketebilir.
+
+---
+
+### MVP Kapsamını Nasıl Belirledim
+
+Şikayetlerin kök nedenine geri döndüm ve her birini doğrudan karşılayan minimum değişiklik setini belirledim:
+
+| Şikayet | MVP Çözümü | Kapsam Dışı Bırakılan |
+|---|---|---|
+| "Dokümanı bulamıyorum" | Computed column + LIKE search, kategori/tarih filtresi | ML sıralama, fuzzy matching |
+| "Arama sonuçları karışık" | Boş sonuçta `suggestions` listesi, anlamlı geri bildirim | UI yeniden tasarımı |
+| "Aynı dokümanı tekrar yüklüyorum" | SHA-256 duplicate detection, 409 + mevcut dosya linki | Versiyon yönetimi, diff görünümü |
+| 400ms sınırı | `IMemoryCache` ile sorgu cache'leme | Redis |
+
+MVP kriteri şuydu: **kullanıcı şikayetlerinin kökünü kesen, mevcut kısıtlar içinde çalışan, minimum değişiklik seti.** Bunun ötesine geçen her şey teknik borç listesine alındı.
+
+---
+
 ## Mimari
 
 ```
